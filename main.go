@@ -226,9 +226,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = apprv.createApprovalIssue(ctx)
+	err = apprv.findOrCreateApprovalIssue(ctx)
 	if err != nil {
-		fmt.Printf("error creating issue: %v", err)
+		fmt.Printf("error finding or creating issue: %v", err)
 		os.Exit(1)
 	}
 

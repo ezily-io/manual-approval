@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v43/github"
 )
@@ -58,28 +59,165 @@ func (a approvalEnvironment) runURL() string {
 	return fmt.Sprintf("%s%s/actions/runs/%d", baseUrl, a.repoFullName, a.runID)
 }
 
-func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
-	issueTitle := fmt.Sprintf("Manual approval required for workflow run %d", a.runID)
-
+// resolvedIssueTitle returns the caller-supplied issue title, or a title
+// derived from the run ID if none was given. The latter is always unique per
+// run, so it never matches an existing issue in findExistingIssue - this
+// keeps find-or-create a no-op (always create) for callers who don't pass a
+// stable issue-title, matching the original behavior.
+func (a *approvalEnvironment) resolvedIssueTitle() string {
 	if a.issueTitle != "" {
-		issueTitle = a.issueTitle
+		return a.issueTitle
 	}
+	return fmt.Sprintf("Manual approval required for workflow run %d", a.runID)
+}
+
+// findOrCreateApprovalIssue reuses an existing open or closed issue whose
+// title exactly matches the resolved issue title - for example one already
+// created by another workflow run approving the same deployment batch - or
+// creates a new one if none exists yet.
+func (a *approvalEnvironment) findOrCreateApprovalIssue(ctx context.Context) error {
+	found, err := a.findExistingIssue(ctx)
+	if err != nil {
+		return err
+	}
+	if found {
+		fmt.Printf("Reusing existing issue: %s\n", a.approvalIssue.GetHTMLURL())
+		return nil
+	}
+
+	if err := a.createApprovalIssue(ctx); err != nil {
+		return err
+	}
+
+	return a.reconcileDuplicate(ctx)
+}
+
+func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, error) {
+	title := a.resolvedIssueTitle()
+	matches, err := a.searchIssuesByTitle(ctx, title)
+	if err != nil {
+		return false, fmt.Errorf("failed to search for existing approval issue: %w", err)
+	}
+	if len(matches) == 0 {
+		return false, nil
+	}
+
+	canonical := lowestNumberedIssue(matches)
+	a.approvalIssue = canonical
+	a.approvalIssueNumber = canonical.GetNumber()
+	return true, nil
+}
+
+// reconcileDuplicate guards against the race where two workflow runs each
+// search for an existing issue at nearly the same time, both find nothing
+// (GitHub's search index lags slightly behind writes), and both create one.
+// It re-searches shortly after creating, and if more than one issue now
+// matches, defers to the lowest-numbered one (the first created), closing
+// this run's issue as a duplicate.
+func (a *approvalEnvironment) reconcileDuplicate(ctx context.Context) error {
+	time.Sleep(duplicateReconcileDelay)
+
+	title := a.resolvedIssueTitle()
+	matches, err := a.searchIssuesByTitle(ctx, title)
+	if err != nil {
+		// Best-effort check; a transient search failure shouldn't fail the run.
+		fmt.Printf("warning: failed to check for duplicate approval issues: %v\n", err)
+		return nil
+	}
+	if len(matches) <= 1 {
+		return nil
+	}
+
+	canonical := lowestNumberedIssue(matches)
+	if canonical.GetNumber() == a.approvalIssueNumber {
+		return nil
+	}
+
+	fmt.Printf("Detected a duplicate approval issue (#%d); deferring to #%d\n", a.approvalIssueNumber, canonical.GetNumber())
+
+	duplicateComment := fmt.Sprintf("Duplicate approval issue; deferring to #%d.", canonical.GetNumber())
+	if _, _, err := a.client.Issues.CreateComment(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber, &github.IssueComment{Body: &duplicateComment}); err != nil {
+		return fmt.Errorf("failed to comment on duplicate issue: %w", err)
+	}
+
+	closedState := "closed"
+	if _, _, err := a.client.Issues.Edit(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber, &github.IssueRequest{State: &closedState}); err != nil {
+		return fmt.Errorf("failed to close duplicate issue: %w", err)
+	}
+
+	a.approvalIssue = canonical
+	a.approvalIssueNumber = canonical.GetNumber()
+	return nil
+}
+
+func (a *approvalEnvironment) searchIssuesByTitle(ctx context.Context, title string) ([]*github.Issue, error) {
+	query := fmt.Sprintf(`repo:%s/%s is:issue in:title "%s"`, a.targetRepoOwner, a.targetRepoName, title)
+	result, _, err := a.client.Search.Issues(ctx, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	// The search API matches on tokens within the title, so defensively
+	// require an exact title match rather than trusting it did a phrase match.
+	return exactTitleMatches(result.Issues, title), nil
+}
+
+func exactTitleMatches(issues []*github.Issue, title string) []*github.Issue {
+	matches := make([]*github.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue.GetTitle() == title {
+			matches = append(matches, issue)
+		}
+	}
+	return matches
+}
+
+// lowestNumberedIssue returns the issue with the smallest number, i.e. the
+// one created first, used as the canonical issue when more than one match.
+func lowestNumberedIssue(issues []*github.Issue) *github.Issue {
+	canonical := issues[0]
+	for _, issue := range issues[1:] {
+		if issue.GetNumber() < canonical.GetNumber() {
+			canonical = issue
+		}
+	}
+	return canonical
+}
+
+func formatCustomIssueBody(body string) string {
+	if body == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n%s\n", body)
+}
+
+func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
+	issueTitle := a.resolvedIssueTitle()
 
 	approversBody := ""
 	for _, approver := range a.issueApprovers {
 		approversBody = fmt.Sprintf("%s> * @%s\n", approversBody, approver)
 	}
 
+	// Embed the caller-supplied issue-body directly in the issue so it's
+	// visible up front, unless it's long enough to risk exceeding GitHub's
+	// issue body size limit - then it's posted as a follow-up comment instead.
+	customBody := a.issueBody
+	deferCustomBodyToComment := len(customBody) > maxEmbeddedCustomBodyLength
+	if deferCustomBodyToComment {
+		customBody = ""
+	}
+
 	issueBody := fmt.Sprintf(`> Workflow is pending manual review.
 > URL: %s
-
+%s
 > [!IMPORTANT]
-> Required approvers: 
+> Required approvers:
 %s
 
 > [!TIP]
 > Respond %s to continue workflow or %s to cancel.`,
 		a.runURL(),
+		formatCustomIssueBody(customBody),
 		approversBody,
 		formatAcceptedWords(approvedWords),
 		formatAcceptedWords(deniedWords),
@@ -106,15 +244,17 @@ func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
 	}
 	a.approvalIssueNumber = a.approvalIssue.GetNumber()
 
-  bodyChunks := splitLongString(a.issueBody)
-  for _, chunk := range bodyChunks {
-      _, _, err = a.client.Issues.CreateComment(ctx, a.targetRepoOwner, a.targetRepoName, *a.approvalIssue.Number, &github.IssueComment{
-          Body: &chunk,
-      })
-      if err != nil {
-          return fmt.Errorf("failed to add comment chunk to issue: %w", err)
-      }
-  }
+	if deferCustomBodyToComment && a.issueBody != "" {
+		bodyChunks := splitLongString(a.issueBody)
+		for _, chunk := range bodyChunks {
+			_, _, err = a.client.Issues.CreateComment(ctx, a.targetRepoOwner, a.targetRepoName, *a.approvalIssue.Number, &github.IssueComment{
+				Body: &chunk,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to add comment chunk to issue: %w", err)
+			}
+		}
+	}
 
 	fmt.Printf("Issue created: %s\n", a.approvalIssue.GetHTMLURL())
 	return nil

@@ -9,6 +9,11 @@ import (
 const (
 	pollingInterval time.Duration = 10 * time.Second
 
+	// maxEmbeddedCustomBodyLength keeps the caller-supplied issue-body embedded
+	// in the issue's own body safely under GitHub's issue body size limit. If
+	// it's longer than this, it's posted as a follow-up comment instead.
+	maxEmbeddedCustomBodyLength int = 60000
+
 	envVarRepoFullName                       string = "GITHUB_REPOSITORY"
 	envVarRunID                              string = "GITHUB_RUN_ID"
 	envVarRepoOwner                          string = "GITHUB_REPOSITORY_OWNER"
@@ -33,6 +38,11 @@ var (
 
 	approvedWords = append([]string{"approved", "approve", "lgtm", "yes"}, additionalApprovedWords...)
 	deniedWords   = append([]string{"denied", "deny", "no"}, additionalDeniedWords...)
+
+	// duplicateReconcileDelay gives GitHub's search index a moment to catch up
+	// before re-checking for a duplicate issue created by a concurrent workflow
+	// run. It's a var (not const) so tests can shrink it to 0.
+	duplicateReconcileDelay = 5 * time.Second
 )
 
 func readAdditionalWords(envVar string) []string {
