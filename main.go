@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -12,6 +13,25 @@ import (
 	"github.com/google/go-github/v43/github"
 	"golang.org/x/oauth2"
 )
+
+// closeIssueIdempotent closes an issue, treating "already closed by another
+// request" as success rather than an error. Multiple workflow runs sharing
+// one approval issue can race to close it right after approval/denial; by
+// the time one of them loses that race, the desired end state (closed) is
+// already achieved either way.
+func closeIssueIdempotent(ctx context.Context, client *github.Client, owner, repoName string, number int) error {
+	closedState := "closed"
+	_, resp, err := client.Issues.Edit(ctx, owner, repoName, number, &github.IssueRequest{State: &closedState})
+	if err == nil {
+		return nil
+	}
+	if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
+		if issue, _, getErr := client.Issues.Get(ctx, owner, repoName, number); getErr == nil && issue.GetState() == "closed" {
+			return nil
+		}
+	}
+	return err
+}
 
 func handleInterrupt(ctx context.Context, client *github.Client, apprv *approvalEnvironment) {
 	newState := "closed"
@@ -36,11 +56,16 @@ func newCommentLoopChannel(ctx context.Context, apprv *approvalEnvironment, clie
 	channel := make(chan int)
 	go func() {
 		for {
+			if err := apprv.reconcileDuplicate(ctx); err != nil {
+				fmt.Printf("warning: failed to reconcile a duplicate approval issue: %v\n", err)
+			}
+
 			comments, _, err := client.Issues.ListComments(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueListCommentsOptions{})
 			if err != nil {
 				fmt.Printf("error getting comments: %v\n", err)
 				channel <- 1
 				close(channel)
+				return
 			}
 
 			approved, err := approvalFromComments(comments, apprv.issueApprovers, apprv.minimumApprovals)
@@ -48,31 +73,29 @@ func newCommentLoopChannel(ctx context.Context, apprv *approvalEnvironment, clie
 				fmt.Printf("error getting approval from comments: %v\n", err)
 				channel <- 1
 				close(channel)
+				return
 			}
 			fmt.Printf("Workflow status: %s\n", approved)
 			switch approved {
 			case approvalStatusApproved:
-				newState := "closed"
 				closeComment := fmt.Sprintf("The required number of approvals (%d) has been met; continuing workflow and closing this issue.", apprv.minimumApprovals)
-				_, _, err := client.Issues.CreateComment(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueComment{
-					Body: &closeComment,
-				})
-				if err != nil {
+				if _, _, err := client.Issues.CreateComment(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueComment{Body: &closeComment}); err != nil {
 					fmt.Printf("error commenting on issue: %v\n", err)
 					channel <- 1
 					close(channel)
+					return
 				}
-				_, _, err = client.Issues.Edit(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueRequest{State: &newState})
-				if err != nil {
+				if err := closeIssueIdempotent(ctx, client, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber); err != nil {
 					fmt.Printf("error closing issue: %v\n", err)
 					channel <- 1
 					close(channel)
+					return
 				}
 				channel <- 0
 				fmt.Println("Workflow manual approval completed")
 				close(channel)
+				return
 			case approvalStatusDenied:
-				newState := "closed"
 				closeComment := "Request denied. Closing issue "
 				if !apprv.failOnDenial {
 					closeComment += "but continuing"
@@ -81,22 +104,21 @@ func newCommentLoopChannel(ctx context.Context, apprv *approvalEnvironment, clie
 				}
 				closeComment += " workflow."
 
-				_, _, err := client.Issues.CreateComment(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueComment{
-					Body: &closeComment,
-				})
-				if err != nil {
+				if _, _, err := client.Issues.CreateComment(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueComment{Body: &closeComment}); err != nil {
 					fmt.Printf("error commenting on issue: %v\n", err)
 					channel <- 1
 					close(channel)
+					return
 				}
-				_, _, err = client.Issues.Edit(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueRequest{State: &newState})
-				if err != nil {
+				if err := closeIssueIdempotent(ctx, client, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber); err != nil {
 					fmt.Printf("error closing issue: %v\n", err)
 					channel <- 1
 					close(channel)
+					return
 				}
 				channel <- 1
 				close(channel)
+				return
 			}
 
 			time.Sleep(pollingInterval)
@@ -225,10 +247,12 @@ func main() {
 		fmt.Printf("error creating approval environment: %v\n", err)
 		os.Exit(1)
 	}
+	apprv.workflowName = os.Getenv(envVarWorkflowName)
+	apprv.commitSHA = os.Getenv(envVarSHA)
 
-	err = apprv.createApprovalIssue(ctx)
+	err = apprv.findOrCreateApprovalIssue(ctx)
 	if err != nil {
-		fmt.Printf("error creating issue: %v", err)
+		fmt.Printf("error finding or creating issue: %v", err)
 		os.Exit(1)
 	}
 

@@ -9,10 +9,17 @@ import (
 const (
 	pollingInterval time.Duration = 10 * time.Second
 
+	// maxEmbeddedCustomBodyLength keeps the caller-supplied issue-body embedded
+	// in the issue's own body safely under GitHub's issue body size limit. If
+	// it's longer than this, it's posted as a follow-up comment instead.
+	maxEmbeddedCustomBodyLength int = 60000
+
 	envVarRepoFullName                       string = "GITHUB_REPOSITORY"
 	envVarRunID                              string = "GITHUB_RUN_ID"
 	envVarRepoOwner                          string = "GITHUB_REPOSITORY_OWNER"
 	envVarWorkflowInitiator                  string = "GITHUB_ACTOR"
+	envVarWorkflowName                       string = "GITHUB_WORKFLOW"
+	envVarSHA                                string = "GITHUB_SHA"
 	envVarToken                              string = "INPUT_SECRET"
 	envVarApprovers                          string = "INPUT_APPROVERS"
 	envVarMinimumApprovals                   string = "INPUT_MINIMUM-APPROVALS"
