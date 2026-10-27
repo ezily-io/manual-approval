@@ -53,4 +53,4 @@ outputs:
     description: The status of the approval ("approved" or "denied")
 runs:
   using: docker
-  image: docker://221082178169.dkr.ecr.ap-northeast-1.amazonaws.com/ezily-io/manual-approval:v2
+  image: docker://ghcr.io/ezily-io/manual-approval:v2-tmp
