@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/google/go-github/v43/github"
@@ -465,6 +466,144 @@ func TestCreateApprovalIssueDefersLongCustomBodyToComment(t *testing.T) {
 	if !commentPosted {
 		t.Fatal("expected an overly long custom body to be posted as a follow-up comment")
 	}
+}
+
+func TestFormatListenerSection(t *testing.T) {
+	if got := formatListenerSection("", "https://x"); got != "" {
+		t.Fatalf("expected empty section when workflowName is empty, got %q", got)
+	}
+
+	got := formatListenerSection("CM CD-Prod", "https://github.com/o/r/actions/runs/1")
+	want := "\n\n**Listening workflows:**\n- [CM CD-Prod](https://github.com/o/r/actions/runs/1)"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestCreateApprovalIssueIncludesListenerSection(t *testing.T) {
+	var createdBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		createdBody = body.Body
+		writeJSON(t, w, &github.Issue{Number: github.Int(1), Title: &body.Title, HTMLURL: github.String("https://github.com/o/r/issues/1")})
+	})
+
+	a := &approvalEnvironment{
+		client:          newTestClient(t, mux),
+		issueTitle:      "t",
+		workflowName:    "CM CD-Prod",
+		targetRepoOwner: "o",
+		targetRepoName:  "r",
+		runID:           123,
+	}
+
+	if err := a.createApprovalIssue(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(createdBody, "**Listening workflows:**") || !strings.Contains(createdBody, "CM CD-Prod") {
+		t.Fatalf("expected the creating workflow to be listed as the first listener, got:\n%s", createdBody)
+	}
+}
+
+func TestRegisterAsListener(t *testing.T) {
+	t.Run("appends_entry_while_preserving_existing_ones", func(t *testing.T) {
+		var editedBody string
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/issues/5", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				writeJSON(t, w, &github.Issue{
+					Number: github.Int(5),
+					Body:   github.String("some body\n\n**Listening workflows:**\n- [CM CD-Prod](https://github.com/o/r/actions/runs/1)"),
+				})
+			case http.MethodPatch:
+				var body struct {
+					Body string `json:"body"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("failed to decode request body: %v", err)
+				}
+				editedBody = body.Body
+				writeJSON(t, w, &github.Issue{Number: github.Int(5), Body: &body.Body})
+			default:
+				t.Fatalf("unexpected method %s", r.Method)
+			}
+		})
+
+		a := &approvalEnvironment{
+			client:              newTestClient(t, mux),
+			targetRepoOwner:     "o",
+			targetRepoName:      "r",
+			approvalIssueNumber: 5,
+			workflowName:        "Org Manager CD-Prod",
+			runID:               2,
+		}
+		newEntry := listenerEntry(a.workflowName, a.runURL())
+
+		if err := a.registerAsListener(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(editedBody, newEntry) {
+			t.Fatalf("expected new listener entry %q in updated body, got:\n%s", newEntry, editedBody)
+		}
+		if !strings.Contains(editedBody, "CM CD-Prod") {
+			t.Fatalf("expected existing listener entry to be preserved, got:\n%s", editedBody)
+		}
+	})
+
+	t.Run("no_op_when_already_listed", func(t *testing.T) {
+		var entry string
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/issues/5", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				writeJSON(t, w, &github.Issue{
+					Number: github.Int(5),
+					Body:   github.String("**Listening workflows:**\n" + entry),
+				})
+				return
+			}
+			t.Fatalf("expected no edit when this run is already listed, got method %s", r.Method)
+		})
+
+		a := &approvalEnvironment{
+			client:              newTestClient(t, mux),
+			targetRepoOwner:     "o",
+			targetRepoName:      "r",
+			approvalIssueNumber: 5,
+			workflowName:        "CM CD-Prod",
+			runID:               2,
+		}
+		entry = listenerEntry(a.workflowName, a.runURL())
+
+		if err := a.registerAsListener(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("no_op_when_workflow_name_empty", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/issues/5", func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("expected no API calls when workflowName is empty")
+		})
+
+		a := &approvalEnvironment{
+			client:              newTestClient(t, mux),
+			targetRepoOwner:     "o",
+			targetRepoName:      "r",
+			approvalIssueNumber: 5,
+		}
+
+		if err := a.registerAsListener(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }
 
 func contains(haystack, needle string) bool {

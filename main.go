@@ -229,6 +229,7 @@ func main() {
 		fmt.Printf("error creating approval environment: %v\n", err)
 		os.Exit(1)
 	}
+	apprv.workflowName = os.Getenv(envVarWorkflowName)
 
 	err = apprv.findOrCreateApprovalIssue(ctx)
 	if err != nil {

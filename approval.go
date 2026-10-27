@@ -16,6 +16,7 @@ type approvalEnvironment struct {
 	repo                string
 	repoOwner           string
 	runID               int
+	workflowName        string
 	approvalIssue       *github.Issue
 	approvalIssueNumber int
 	issueTitle          string
@@ -100,7 +101,57 @@ func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, erro
 	canonical := lowestNumberedIssue(matches)
 	a.approvalIssue = canonical
 	a.approvalIssueNumber = canonical.GetNumber()
+	if err := a.registerAsListener(ctx); err != nil {
+		fmt.Printf("warning: failed to register as a listener on issue #%d: %v\n", a.approvalIssueNumber, err)
+	}
 	return true, nil
+}
+
+// registerAsListener records this workflow run in the issue body's
+// "Listening workflows" list, so anyone reading the issue can see every
+// workflow run currently waiting on it - not just the one that created it.
+// A no-op if this run is already listed (e.g. a retried step) or if the
+// workflow name isn't available. Re-fetches the issue immediately before
+// editing to narrow (not eliminate) the lost-update race against other
+// runs registering at the same time.
+func (a *approvalEnvironment) registerAsListener(ctx context.Context) error {
+	if a.workflowName == "" {
+		return nil
+	}
+
+	issue, _, err := a.client.Issues.Get(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber)
+	if err != nil {
+		return fmt.Errorf("failed to fetch issue #%d: %w", a.approvalIssueNumber, err)
+	}
+
+	entry := listenerEntry(a.workflowName, a.runURL())
+	body := issue.GetBody()
+	if strings.Contains(body, entry) {
+		return nil
+	}
+
+	newBody := body + "\n" + entry
+	updated, _, err := a.client.Issues.Edit(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber, &github.IssueRequest{Body: &newBody})
+	if err != nil {
+		return fmt.Errorf("failed to update issue body: %w", err)
+	}
+	a.approvalIssue = updated
+	return nil
+}
+
+func listenerEntry(workflowName, runURL string) string {
+	return fmt.Sprintf("- [%s](%s)", workflowName, runURL)
+}
+
+// formatListenerSection renders the initial "Listening workflows" section
+// for a newly created issue, naming the creating run as the first listener.
+// Later runs that find and reuse this issue append their own entry to this
+// same section via registerAsListener.
+func formatListenerSection(workflowName, runURL string) string {
+	if workflowName == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n\n**Listening workflows:**\n%s", listenerEntry(workflowName, runURL))
 }
 
 // reconcileDuplicate guards against the race where two workflow runs each
@@ -144,6 +195,9 @@ func (a *approvalEnvironment) reconcileDuplicate(ctx context.Context) error {
 
 	a.approvalIssue = canonical
 	a.approvalIssueNumber = canonical.GetNumber()
+	if err := a.registerAsListener(ctx); err != nil {
+		fmt.Printf("warning: failed to register as a listener on issue #%d: %v\n", a.approvalIssueNumber, err)
+	}
 	return nil
 }
 
@@ -212,12 +266,13 @@ func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
 %s
 
 > [!TIP]
-> Respond %s to continue workflow or %s to cancel.`,
+> Respond %s to continue workflow or %s to cancel.%s`,
 		a.runURL(),
 		formatCustomIssueBody(customBody),
 		approversBody,
 		formatAcceptedWords(approvedWords),
 		formatAcceptedWords(deniedWords),
+		formatListenerSection(a.workflowName, a.runURL()),
 	)
 
 	issueBody = fmt.Sprintf(">[!NOTE]\n%s", issueBody)
