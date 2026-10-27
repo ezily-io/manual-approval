@@ -625,6 +625,60 @@ func TestRegisterAsListener(t *testing.T) {
 	})
 }
 
+func TestCloseIssueIdempotent(t *testing.T) {
+	t.Run("succeeds_normally", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/issues/5", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPatch {
+				t.Fatalf("unexpected method %s", r.Method)
+			}
+			writeJSON(t, w, &github.Issue{Number: github.Int(5), State: github.String("closed")})
+		})
+
+		if err := closeIssueIdempotent(context.Background(), newTestClient(t, mux), "o", "r", 5); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("treats_already_closed_conflict_as_success", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/issues/5", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPatch:
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				writeJSON(t, w, &github.ErrorResponse{Message: "Validation Failed"})
+			case http.MethodGet:
+				writeJSON(t, w, &github.Issue{Number: github.Int(5), State: github.String("closed")})
+			default:
+				t.Fatalf("unexpected method %s", r.Method)
+			}
+		})
+
+		if err := closeIssueIdempotent(context.Background(), newTestClient(t, mux), "o", "r", 5); err != nil {
+			t.Fatalf("expected an already-closed conflict to be treated as success, got: %v", err)
+		}
+	})
+
+	t.Run("propagates_a_real_422_that_isnt_already_closed", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/repos/o/r/issues/5", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPatch:
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				writeJSON(t, w, &github.ErrorResponse{Message: "Validation Failed"})
+			case http.MethodGet:
+				writeJSON(t, w, &github.Issue{Number: github.Int(5), State: github.String("open")})
+			default:
+				t.Fatalf("unexpected method %s", r.Method)
+			}
+		})
+
+		if err := closeIssueIdempotent(context.Background(), newTestClient(t, mux), "o", "r", 5); err == nil {
+			t.Fatal("expected a real validation error to propagate when the issue isn't actually closed")
+		}
+	})
+}
+
 func contains(haystack, needle string) bool {
 	return len(needle) == 0 || (len(haystack) >= len(needle) && (func() bool {
 		for i := 0; i+len(needle) <= len(haystack); i++ {
