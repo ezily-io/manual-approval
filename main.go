@@ -36,6 +36,10 @@ func newCommentLoopChannel(ctx context.Context, apprv *approvalEnvironment, clie
 	channel := make(chan int)
 	go func() {
 		for {
+			if err := apprv.reconcileDuplicate(ctx); err != nil {
+				fmt.Printf("warning: failed to reconcile a duplicate approval issue: %v\n", err)
+			}
+
 			comments, _, err := client.Issues.ListComments(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueListCommentsOptions{})
 			if err != nil {
 				fmt.Printf("error getting comments: %v\n", err)

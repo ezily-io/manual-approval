@@ -184,11 +184,6 @@ func TestFindExistingIssue(t *testing.T) {
 }
 
 func TestFindOrCreateApprovalIssue(t *testing.T) {
-	// Speed up the test; the delay only matters for real search index lag.
-	originalDelay := duplicateReconcileDelay
-	duplicateReconcileDelay = 0
-	t.Cleanup(func() { duplicateReconcileDelay = originalDelay })
-
 	title := "Production deployment approval - abc123"
 
 	t.Run("reuses_existing_issue_without_creating", func(t *testing.T) {
@@ -220,23 +215,12 @@ func TestFindOrCreateApprovalIssue(t *testing.T) {
 		}
 	})
 
-	t.Run("creates_when_none_found_and_no_duplicate_appears", func(t *testing.T) {
+	t.Run("creates_when_none_found", func(t *testing.T) {
 		searchCalls := 0
 		mux := http.NewServeMux()
 		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
 			searchCalls++
-			if searchCalls == 1 {
-				// Nothing exists yet.
-				writeJSON(t, w, &github.IssuesSearchResult{Total: github.Int(0), Issues: []*github.Issue{}})
-				return
-			}
-			// Reconcile pass: only the issue we just created shows up.
-			writeJSON(t, w, &github.IssuesSearchResult{
-				Total: github.Int(1),
-				Issues: []*github.Issue{
-					{Number: github.Int(7), Title: github.String(title), HTMLURL: github.String("https://github.com/o/r/issues/7")},
-				},
-			})
+			writeJSON(t, w, &github.IssuesSearchResult{Total: github.Int(0), Issues: []*github.Issue{}})
 		})
 		mux.HandleFunc("/repos/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -265,17 +249,15 @@ func TestFindOrCreateApprovalIssue(t *testing.T) {
 		if a.approvalIssueNumber != 7 {
 			t.Fatalf("expected newly created issue #7 but got #%d", a.approvalIssueNumber)
 		}
-		if searchCalls != 2 {
-			t.Fatalf("expected 2 search calls (find + reconcile) but got %d", searchCalls)
+		// findOrCreateApprovalIssue itself only searches once; duplicate
+		// reconciliation now happens separately, from the polling loop.
+		if searchCalls != 1 {
+			t.Fatalf("expected 1 search call but got %d", searchCalls)
 		}
 	})
 }
 
 func TestReconcileDuplicate(t *testing.T) {
-	originalDelay := duplicateReconcileDelay
-	duplicateReconcileDelay = 0
-	t.Cleanup(func() { duplicateReconcileDelay = originalDelay })
-
 	title := "Production deployment approval - abc123"
 
 	t.Run("defers_to_lowest_numbered_and_closes_ours", func(t *testing.T) {

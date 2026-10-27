@@ -6,7 +6,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/google/go-github/v43/github"
 )
@@ -85,11 +84,7 @@ func (a *approvalEnvironment) findOrCreateApprovalIssue(ctx context.Context) err
 		return nil
 	}
 
-	if err := a.createApprovalIssue(ctx); err != nil {
-		return err
-	}
-
-	return a.reconcileDuplicate(ctx)
+	return a.createApprovalIssue(ctx)
 }
 
 func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, error) {
@@ -111,12 +106,14 @@ func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, erro
 // reconcileDuplicate guards against the race where two workflow runs each
 // search for an existing issue at nearly the same time, both find nothing
 // (GitHub's search index lags slightly behind writes), and both create one.
-// It re-searches shortly after creating, and if more than one issue now
-// matches, defers to the lowest-numbered one (the first created), closing
-// this run's issue as a duplicate.
+// It's called on every iteration of the comment-polling loop rather than
+// once after creation: search index lag is variable and sometimes exceeds
+// a few seconds, so a single delayed check isn't reliable, but the loop
+// already runs every pollingInterval for the duration of the wait, so
+// piggybacking this check costs nothing extra in wall-clock time. If more
+// than one issue now matches, defers to the lowest-numbered one (the first
+// created), closing this run's issue as a duplicate.
 func (a *approvalEnvironment) reconcileDuplicate(ctx context.Context) error {
-	time.Sleep(duplicateReconcileDelay)
-
 	title := a.resolvedIssueTitle()
 	matches, err := a.searchIssuesByTitle(ctx, title)
 	if err != nil {

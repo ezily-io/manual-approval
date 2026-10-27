@@ -38,11 +38,6 @@ var (
 
 	approvedWords = append([]string{"approved", "approve", "lgtm", "yes"}, additionalApprovedWords...)
 	deniedWords   = append([]string{"denied", "deny", "no"}, additionalDeniedWords...)
-
-	// duplicateReconcileDelay gives GitHub's search index a moment to catch up
-	// before re-checking for a duplicate issue created by a concurrent workflow
-	// run. It's a var (not const) so tests can shrink it to 0.
-	duplicateReconcileDelay = 5 * time.Second
 )
 
 func readAdditionalWords(envVar string) []string {
