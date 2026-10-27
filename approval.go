@@ -6,9 +6,14 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v43/github"
 )
+
+// timeNow is a seam for tests to pin the clock; production code should
+// always call this instead of time.Now directly.
+var timeNow = time.Now
 
 type approvalEnvironment struct {
 	client              *github.Client
@@ -17,6 +22,7 @@ type approvalEnvironment struct {
 	repoOwner           string
 	runID               int
 	workflowName        string
+	commitSHA           string
 	approvalIssue       *github.Issue
 	approvalIssueNumber int
 	issueTitle          string
@@ -124,7 +130,7 @@ func (a *approvalEnvironment) registerAsListener(ctx context.Context) error {
 		return fmt.Errorf("failed to fetch issue #%d: %w", a.approvalIssueNumber, err)
 	}
 
-	entry := listenerEntry(a.workflowName, a.runURL())
+	entry := listenerEntry(a.workflowName, a.runURL(), a.commitSHA, timeNow())
 	body := issue.GetBody()
 	if strings.Contains(body, entry) {
 		return nil
@@ -139,19 +145,27 @@ func (a *approvalEnvironment) registerAsListener(ctx context.Context) error {
 	return nil
 }
 
-func listenerEntry(workflowName, runURL string) string {
-	return fmt.Sprintf("- [%s](%s)", workflowName, runURL)
+func listenerEntry(workflowName, runURL, commitSHA string, at time.Time) string {
+	return fmt.Sprintf("- [%s](%s) — `%s` at %s", workflowName, runURL, shortSHA(commitSHA), at.UTC().Format("2006-01-02 15:04:05 MST"))
+}
+
+func shortSHA(sha string) string {
+	const shortLength = 7
+	if len(sha) > shortLength {
+		return sha[:shortLength]
+	}
+	return sha
 }
 
 // formatListenerSection renders the initial "Listening workflows" section
 // for a newly created issue, naming the creating run as the first listener.
 // Later runs that find and reuse this issue append their own entry to this
 // same section via registerAsListener.
-func formatListenerSection(workflowName, runURL string) string {
+func formatListenerSection(workflowName, runURL, commitSHA string, at time.Time) string {
 	if workflowName == "" {
 		return ""
 	}
-	return fmt.Sprintf("\n\n**Listening workflows:**\n%s", listenerEntry(workflowName, runURL))
+	return fmt.Sprintf("\n\n**Listening workflows:**\n%s", listenerEntry(workflowName, runURL, commitSHA, at))
 }
 
 // reconcileDuplicate guards against the race where two workflow runs each
@@ -272,7 +286,7 @@ func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
 		approversBody,
 		formatAcceptedWords(approvedWords),
 		formatAcceptedWords(deniedWords),
-		formatListenerSection(a.workflowName, a.runURL()),
+		formatListenerSection(a.workflowName, a.runURL(), a.commitSHA, timeNow()),
 	)
 
 	issueBody = fmt.Sprintf(">[!NOTE]\n%s", issueBody)

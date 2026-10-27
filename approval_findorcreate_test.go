@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v43/github"
 )
@@ -468,15 +469,26 @@ func TestCreateApprovalIssueDefersLongCustomBodyToComment(t *testing.T) {
 	}
 }
 
+var fixedTestTime = time.Date(2026, 10, 27, 8, 28, 42, 0, time.UTC)
+
 func TestFormatListenerSection(t *testing.T) {
-	if got := formatListenerSection("", "https://x"); got != "" {
+	if got := formatListenerSection("", "https://x", "abc123", fixedTestTime); got != "" {
 		t.Fatalf("expected empty section when workflowName is empty, got %q", got)
 	}
 
-	got := formatListenerSection("CM CD-Prod", "https://github.com/o/r/actions/runs/1")
-	want := "\n\n**Listening workflows:**\n- [CM CD-Prod](https://github.com/o/r/actions/runs/1)"
+	got := formatListenerSection("CM CD-Prod", "https://github.com/o/r/actions/runs/1", "0f2844a98d8fa418fa6560ebf2058cf47bc5a987", fixedTestTime)
+	want := "\n\n**Listening workflows:**\n- [CM CD-Prod](https://github.com/o/r/actions/runs/1) — `0f2844a` at 2026-10-27 08:28:42 UTC"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestShortSHA(t *testing.T) {
+	if got := shortSHA("0f2844a98d8fa418fa6560ebf2058cf47bc5a987"); got != "0f2844a" {
+		t.Fatalf("expected a 7-char short SHA, got %q", got)
+	}
+	if got := shortSHA("abc"); got != "abc" {
+		t.Fatalf("expected a short input to be returned unchanged, got %q", got)
 	}
 }
 
@@ -499,6 +511,7 @@ func TestCreateApprovalIssueIncludesListenerSection(t *testing.T) {
 		client:          newTestClient(t, mux),
 		issueTitle:      "t",
 		workflowName:    "CM CD-Prod",
+		commitSHA:       "0f2844a98d8fa418fa6560ebf2058cf47bc5a987",
 		targetRepoOwner: "o",
 		targetRepoName:  "r",
 		runID:           123,
@@ -507,12 +520,16 @@ func TestCreateApprovalIssueIncludesListenerSection(t *testing.T) {
 	if err := a.createApprovalIssue(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(createdBody, "**Listening workflows:**") || !strings.Contains(createdBody, "CM CD-Prod") {
+	if !strings.Contains(createdBody, "**Listening workflows:**") || !strings.Contains(createdBody, "CM CD-Prod") || !strings.Contains(createdBody, "0f2844a") {
 		t.Fatalf("expected the creating workflow to be listed as the first listener, got:\n%s", createdBody)
 	}
 }
 
 func TestRegisterAsListener(t *testing.T) {
+	originalNow := timeNow
+	timeNow = func() time.Time { return fixedTestTime }
+	t.Cleanup(func() { timeNow = originalNow })
+
 	t.Run("appends_entry_while_preserving_existing_ones", func(t *testing.T) {
 		var editedBody string
 		mux := http.NewServeMux()
@@ -543,9 +560,10 @@ func TestRegisterAsListener(t *testing.T) {
 			targetRepoName:      "r",
 			approvalIssueNumber: 5,
 			workflowName:        "Org Manager CD-Prod",
+			commitSHA:           "0f2844a98d8fa418fa6560ebf2058cf47bc5a987",
 			runID:               2,
 		}
-		newEntry := listenerEntry(a.workflowName, a.runURL())
+		newEntry := listenerEntry(a.workflowName, a.runURL(), a.commitSHA, fixedTestTime)
 
 		if err := a.registerAsListener(context.Background()); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -578,9 +596,10 @@ func TestRegisterAsListener(t *testing.T) {
 			targetRepoName:      "r",
 			approvalIssueNumber: 5,
 			workflowName:        "CM CD-Prod",
+			commitSHA:           "0f2844a98d8fa418fa6560ebf2058cf47bc5a987",
 			runID:               2,
 		}
-		entry = listenerEntry(a.workflowName, a.runURL())
+		entry = listenerEntry(a.workflowName, a.runURL(), a.commitSHA, fixedTestTime)
 
 		if err := a.registerAsListener(context.Background()); err != nil {
 			t.Fatalf("unexpected error: %v", err)

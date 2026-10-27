@@ -230,6 +230,7 @@ func main() {
 		os.Exit(1)
 	}
 	apprv.workflowName = os.Getenv(envVarWorkflowName)
+	apprv.commitSHA = os.Getenv(envVarSHA)
 
 	err = apprv.findOrCreateApprovalIssue(ctx)
 	if err != nil {
