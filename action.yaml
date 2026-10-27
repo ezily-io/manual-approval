@@ -53,4 +53,4 @@ outputs:
     description: The status of the approval ("approved" or "denied")
 runs:
   using: docker
-  image: docker://ghcr.io/ezily-io/manual-approval:v2-tmp
+  image: 'Dockerfile'
