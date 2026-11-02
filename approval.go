@@ -16,22 +16,23 @@ import (
 var timeNow = time.Now
 
 type approvalEnvironment struct {
-	client              *github.Client
-	repoFullName        string
-	repo                string
-	repoOwner           string
-	runID               int
-	workflowName        string
-	commitSHA           string
-	approvalIssue       *github.Issue
-	approvalIssueNumber int
-	issueTitle          string
-	issueBody           string
-	issueApprovers      []string
-	minimumApprovals    int
-	targetRepoOwner     string
-	targetRepoName      string
-	failOnDenial        bool
+	client                *github.Client
+	repoFullName          string
+	repo                  string
+	repoOwner             string
+	runID                 int
+	workflowName          string
+	commitSHA             string
+	approvalIssue         *github.Issue
+	approvalIssueNumber   int
+	supersededIssueNumber int
+	issueTitle            string
+	issueBody             string
+	issueApprovers        []string
+	minimumApprovals      int
+	targetRepoOwner       string
+	targetRepoName        string
+	failOnDenial          bool
 }
 
 func newApprovalEnvironment(client *github.Client, repoFullName, repoOwner string, runID int, approvers []string, minimumApprovals int, issueTitle, issueBody string, targetRepoOwner string, targetRepoName string, failOnDenial bool) (*approvalEnvironment, error) {
@@ -77,10 +78,13 @@ func (a *approvalEnvironment) resolvedIssueTitle() string {
 	return fmt.Sprintf("Manual approval required for workflow run %d", a.runID)
 }
 
-// findOrCreateApprovalIssue reuses an existing open or closed issue whose
-// title exactly matches the resolved issue title - for example one already
-// created by another workflow run approving the same deployment batch - or
-// creates a new one if none exists yet.
+// findOrCreateApprovalIssue reuses an existing open issue, or a closed one
+// with a clear approve/deny outcome, whose title exactly matches the
+// resolved issue title - for example one already created by another
+// workflow run approving the same deployment batch. If every match has been
+// abandoned (closed with no resolution - e.g. a run that timed out or was
+// cancelled before anyone responded), it creates a new issue and links the
+// two together, rather than reusing a dead one.
 func (a *approvalEnvironment) findOrCreateApprovalIssue(ctx context.Context) error {
 	found, err := a.findExistingIssue(ctx)
 	if err != nil {
@@ -91,7 +95,16 @@ func (a *approvalEnvironment) findOrCreateApprovalIssue(ctx context.Context) err
 		return nil
 	}
 
-	return a.createApprovalIssue(ctx)
+	if err := a.createApprovalIssue(ctx); err != nil {
+		return err
+	}
+
+	if a.supersededIssueNumber != 0 {
+		if err := a.linkSupersededIssue(ctx); err != nil {
+			fmt.Printf("warning: failed to link superseded issue #%d: %v\n", a.supersededIssueNumber, err)
+		}
+	}
+	return nil
 }
 
 func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, error) {
@@ -100,16 +113,22 @@ func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("failed to search for existing approval issue: %w", err)
 	}
-
-	reusable, err := a.reusableIssues(ctx, matches)
-	if err != nil {
-		return false, err
-	}
-	if len(reusable) == 0 {
+	if len(matches) == 0 {
 		return false, nil
 	}
 
-	canonical := lowestNumberedIssue(reusable)
+	canonical, usable, err := a.canonicalIssue(ctx, matches)
+	if err != nil {
+		return false, err
+	}
+	if !usable {
+		// Every match has been abandoned - nothing to reuse. Remember which
+		// one, so createApprovalIssue can link the new issue back to it and
+		// note on the old one that it's been superseded.
+		a.supersededIssueNumber = canonical.GetNumber()
+		return false, nil
+	}
+
 	a.approvalIssue = canonical
 	a.approvalIssueNumber = canonical.GetNumber()
 	if err := a.registerAsListener(ctx); err != nil {
@@ -118,34 +137,60 @@ func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, erro
 	return true, nil
 }
 
-// reusableIssues filters out closed issues that were never actually resolved
-// (approved or denied) - e.g. one abandoned by a run that timed out or was
-// cancelled before any approver responded. Reusing one of those would
-// silently attach a retry to a dead issue - no new issue, no new
-// notification, and nothing left to comment on that would ever resolve it -
-// instead of prompting approvers again. Open issues, and closed issues whose
-// comments show a clear approve/deny outcome, are always safe to reuse.
-func (a *approvalEnvironment) reusableIssues(ctx context.Context, issues []*github.Issue) ([]*github.Issue, error) {
-	reusable := make([]*github.Issue, 0, len(issues))
-	for _, issue := range issues {
-		if issue.GetState() != "closed" {
-			reusable = append(reusable, issue)
+// canonicalIssue picks the lowest-numbered issue among matches that's either
+// still open, or closed with a clear approve/deny outcome in its comments.
+// If every match has been abandoned (closed with no resolution), it still
+// returns the lowest-numbered one as a reference point, with usable=false so
+// the caller knows to supersede it rather than reuse or defer to it.
+func (a *approvalEnvironment) canonicalIssue(ctx context.Context, issues []*github.Issue) (issue *github.Issue, usable bool, err error) {
+	var best *github.Issue
+	for _, candidate := range issues {
+		ok, err := a.isUsable(ctx, candidate)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
 			continue
 		}
-
-		comments, _, err := a.client.Issues.ListComments(ctx, a.targetRepoOwner, a.targetRepoName, issue.GetNumber(), &github.IssueListCommentsOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to list comments on issue #%d: %w", issue.GetNumber(), err)
-		}
-		status, err := approvalFromComments(comments, a.issueApprovers, a.minimumApprovals)
-		if err != nil {
-			return nil, fmt.Errorf("failed to evaluate comments on issue #%d: %w", issue.GetNumber(), err)
-		}
-		if status == approvalStatusApproved || status == approvalStatusDenied {
-			reusable = append(reusable, issue)
+		if best == nil || candidate.GetNumber() < best.GetNumber() {
+			best = candidate
 		}
 	}
-	return reusable, nil
+	if best != nil {
+		return best, true, nil
+	}
+	// Every match is abandoned. Reference the most recent one (highest
+	// number), not the original, so repeated abandon-and-retry chains link
+	// consecutively (old -> retry1 -> retry2) instead of every retry fanning
+	// out from the very first attempt.
+	return highestNumberedIssue(issues), false, nil
+}
+
+// isUsable reports whether an issue is still open, or was closed with a
+// clear approve/deny outcome - as opposed to abandoned (closed with no
+// resolution, e.g. a run that timed out or was cancelled before anyone
+// responded).
+func (a *approvalEnvironment) isUsable(ctx context.Context, issue *github.Issue) (bool, error) {
+	if issue.GetState() != "closed" {
+		return true, nil
+	}
+	comments, _, err := a.client.Issues.ListComments(ctx, a.targetRepoOwner, a.targetRepoName, issue.GetNumber(), &github.IssueListCommentsOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to list comments on issue #%d: %w", issue.GetNumber(), err)
+	}
+	status, err := approvalFromComments(comments, a.issueApprovers, a.minimumApprovals)
+	if err != nil {
+		return false, fmt.Errorf("failed to evaluate comments on issue #%d: %w", issue.GetNumber(), err)
+	}
+	return status == approvalStatusApproved || status == approvalStatusDenied, nil
+}
+
+func (a *approvalEnvironment) linkSupersededIssue(ctx context.Context) error {
+	comment := fmt.Sprintf("Superseded by #%d.", a.approvalIssueNumber)
+	if _, _, err := a.client.Issues.CreateComment(ctx, a.targetRepoOwner, a.targetRepoName, a.supersededIssueNumber, &github.IssueComment{Body: &comment}); err != nil {
+		return fmt.Errorf("failed to comment on superseded issue #%d: %w", a.supersededIssueNumber, err)
+	}
+	return nil
 }
 
 // registerAsListener records this workflow run in the issue body's
@@ -203,16 +248,21 @@ func formatListenerSection(workflowName, runURL, commitSHA string, at time.Time)
 	return fmt.Sprintf("\n\n**Listening workflows:**\n%s", listenerEntry(workflowName, runURL, commitSHA, at))
 }
 
-// reconcileDuplicate guards against the race where two workflow runs each
-// search for an existing issue at nearly the same time, both find nothing
-// (GitHub's search index lags slightly behind writes), and both create one.
-// It's called on every iteration of the comment-polling loop rather than
-// once after creation: search index lag is variable and sometimes exceeds
-// a few seconds, so a single delayed check isn't reliable, but the loop
-// already runs every pollingInterval for the duration of the wait, so
-// piggybacking this check costs nothing extra in wall-clock time. If more
-// than one issue now matches, defers to the lowest-numbered one (the first
-// created), closing this run's issue as a duplicate.
+// reconcileDuplicate keeps this run pointed at the best available issue. It
+// handles two situations, both found the same way - searching by title again
+// on every iteration of the comment-polling loop, since it's already running
+// every pollingInterval for the duration of the wait:
+//  1. Two workflow runs raced to create an issue at nearly the same time
+//     (GitHub's search index lags slightly behind writes, so both found
+//     nothing and both created one). The higher-numbered one defers to the
+//     lower-numbered (first created).
+//  2. The issue this run is tracking gets abandoned mid-wait - e.g. another
+//     listener on a shared issue was cancelled, closing it for everyone -
+//     and a different run has since superseded it with a new one. This run
+//     switches to that replacement instead of waiting on a dead issue.
+//
+// Either way, this run's current issue is closed (if not already) and this
+// run re-registers itself as a listener on whichever issue is canonical now.
 func (a *approvalEnvironment) reconcileDuplicate(ctx context.Context) error {
 	title := a.resolvedIssueTitle()
 	matches, err := a.searchIssuesByTitle(ctx, title)
@@ -225,21 +275,23 @@ func (a *approvalEnvironment) reconcileDuplicate(ctx context.Context) error {
 		return nil
 	}
 
-	canonical := lowestNumberedIssue(matches)
-	if canonical.GetNumber() == a.approvalIssueNumber {
+	canonical, usable, err := a.canonicalIssue(ctx, matches)
+	if err != nil {
+		fmt.Printf("warning: failed to evaluate duplicate approval issues: %v\n", err)
+		return nil
+	}
+	if !usable || canonical.GetNumber() == a.approvalIssueNumber {
 		return nil
 	}
 
-	fmt.Printf("Detected a duplicate approval issue (#%d); deferring to #%d\n", a.approvalIssueNumber, canonical.GetNumber())
+	fmt.Printf("Found a better approval issue (#%d) than the one this run is tracking (#%d); switching\n", canonical.GetNumber(), a.approvalIssueNumber)
 
-	duplicateComment := fmt.Sprintf("Duplicate approval issue; deferring to #%d.", canonical.GetNumber())
-	if _, _, err := a.client.Issues.CreateComment(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber, &github.IssueComment{Body: &duplicateComment}); err != nil {
-		return fmt.Errorf("failed to comment on duplicate issue: %w", err)
+	deferComment := fmt.Sprintf("Deferring to #%d.", canonical.GetNumber())
+	if _, _, err := a.client.Issues.CreateComment(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber, &github.IssueComment{Body: &deferComment}); err != nil {
+		return fmt.Errorf("failed to comment on issue #%d: %w", a.approvalIssueNumber, err)
 	}
-
-	closedState := "closed"
-	if _, _, err := a.client.Issues.Edit(ctx, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber, &github.IssueRequest{State: &closedState}); err != nil {
-		return fmt.Errorf("failed to close duplicate issue: %w", err)
+	if err := closeIssueIdempotent(ctx, a.client, a.targetRepoOwner, a.targetRepoName, a.approvalIssueNumber); err != nil {
+		return fmt.Errorf("failed to close issue #%d: %w", a.approvalIssueNumber, err)
 	}
 
 	a.approvalIssue = canonical
@@ -283,11 +335,30 @@ func lowestNumberedIssue(issues []*github.Issue) *github.Issue {
 	return canonical
 }
 
+// highestNumberedIssue returns the issue with the largest number, i.e. the
+// most recently created one.
+func highestNumberedIssue(issues []*github.Issue) *github.Issue {
+	latest := issues[0]
+	for _, issue := range issues[1:] {
+		if issue.GetNumber() > latest.GetNumber() {
+			latest = issue
+		}
+	}
+	return latest
+}
+
 func formatCustomIssueBody(body string) string {
 	if body == "" {
 		return ""
 	}
 	return fmt.Sprintf("\n%s\n", body)
+}
+
+func formatSupersedeNote(supersededIssueNumber int) string {
+	if supersededIssueNumber == 0 {
+		return ""
+	}
+	return fmt.Sprintf("> Supersedes #%d, which was abandoned (closed with no approval or denial) before this run started.\n", supersededIssueNumber)
 }
 
 func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
@@ -309,7 +380,7 @@ func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
 
 	issueBody := fmt.Sprintf(`> Workflow is pending manual review.
 > URL: %s
-%s
+%s%s
 > [!IMPORTANT]
 > Required approvers:
 %s
@@ -317,6 +388,7 @@ func (a *approvalEnvironment) createApprovalIssue(ctx context.Context) error {
 > [!TIP]
 > Respond %s to continue workflow or %s to cancel.%s`,
 		a.runURL(),
+		formatSupersedeNote(a.supersededIssueNumber),
 		formatCustomIssueBody(customBody),
 		approversBody,
 		formatAcceptedWords(approvedWords),
@@ -372,9 +444,9 @@ func (a *approvalEnvironment) SetActionOutputs(outputs map[string]string) (bool,
 		return false, err
 	}
 
-    defer func() {
-        _ = f.Close() // Error explicitly ignored as there is nothing to handle if file close fails.
-    }()
+	defer func() {
+		_ = f.Close() // Error explicitly ignored as there is nothing to handle if file close fails.
+	}()
 
 	var pairs []string
 
@@ -530,10 +602,10 @@ func splitLongString(input string) []string {
 	currentLength := 0
 
 	for i, line := range lines {
-    lineLength := len(line)
+		lineLength := len(line)
 		if i < len(lines)-1 {
 			lineLength++
-    }
+		}
 
 		if currentLength+lineLength > maxLength {
 			if currentChunk.Len() > 0 {
@@ -566,4 +638,3 @@ func splitLongString(input string) []string {
 	}
 	return result
 }
-

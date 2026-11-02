@@ -34,7 +34,6 @@ func closeIssueIdempotent(ctx context.Context, client *github.Client, owner, rep
 }
 
 func handleInterrupt(ctx context.Context, client *github.Client, apprv *approvalEnvironment) {
-	newState := "closed"
 	closeComment := "Workflow cancelled, closing issue."
 
 	fmt.Println(closeComment)
@@ -45,8 +44,10 @@ func handleInterrupt(ctx context.Context, client *github.Client, apprv *approval
 		fmt.Printf("error commenting on issue: %v\n", err)
 		return
 	}
-	_, _, err = client.Issues.Edit(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueRequest{State: &newState})
-	if err != nil {
+	// A sibling listener on a shared issue may have already closed it (e.g.
+	// it got approved moments ago), which would otherwise surface as a
+	// spurious error here.
+	if err := closeIssueIdempotent(ctx, client, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber); err != nil {
 		fmt.Printf("error closing issue: %v\n", err)
 		return
 	}
@@ -256,9 +257,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	outputs := map[string]string {
+	outputs := map[string]string{
 		"issue-number": fmt.Sprintf("%d", apprv.approvalIssueNumber),
-		"issue-url": apprv.approvalIssue.GetHTMLURL(),
+		"issue-url":    apprv.approvalIssue.GetHTMLURL(),
 	}
 	_, err = apprv.SetActionOutputs(outputs)
 	if err != nil {
@@ -275,15 +276,15 @@ func main() {
 	case exitCode := <-commentLoopChannel:
 		approvalStatus := ""
 
-		if (!failOnDenial && exitCode == 1) {
+		if !failOnDenial && exitCode == 1 {
 			approvalStatus = "denied"
 			exitCode = 0
-		} else if (exitCode == 1) {
+		} else if exitCode == 1 {
 			approvalStatus = "denied"
 		} else {
 			approvalStatus = "approved"
 		}
-		outputs := map[string]string {
+		outputs := map[string]string{
 			"approval-status": approvalStatus,
 		}
 		if _, err := apprv.SetActionOutputs(outputs); err != nil {

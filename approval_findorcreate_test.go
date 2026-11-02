@@ -184,7 +184,7 @@ func TestFindExistingIssue(t *testing.T) {
 		}
 	})
 
-	t.Run("ignores_a_closed_issue_with_no_clear_resolution", func(t *testing.T) {
+	t.Run("treats_an_abandoned_closed_issue_as_not_found", func(t *testing.T) {
 		// e.g. one abandoned by a run that timed out or was cancelled before
 		// any approver responded - never got an approve/deny comment.
 		mux := http.NewServeMux()
@@ -197,6 +197,55 @@ func TestFindExistingIssue(t *testing.T) {
 			})
 		})
 		mux.HandleFunc("/repos/o/r/issues/30/comments", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Fatalf("expected only a read of comments, got %s", r.Method)
+			}
+			writeJSON(t, w, []*github.IssueComment{})
+		})
+		mux.HandleFunc("/repos/o/r/issues/30", func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("expected no write to the abandoned issue from findExistingIssue itself, got %s", r.Method)
+		})
+
+		a := &approvalEnvironment{
+			client:           newTestClient(t, mux),
+			issueTitle:       title,
+			issueApprovers:   []string{"alice"},
+			minimumApprovals: 1,
+			targetRepoOwner:  "o",
+			targetRepoName:   "r",
+		}
+
+		found, err := a.findExistingIssue(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if found {
+			t.Fatal("expected an abandoned issue not to be reused")
+		}
+		if a.supersededIssueNumber != 30 {
+			t.Fatalf("expected #30 to be remembered as superseded, got #%d", a.supersededIssueNumber)
+		}
+	})
+
+	t.Run("supersedes_the_most_recent_abandoned_issue_when_several_exist", func(t *testing.T) {
+		// A chain of abandon-then-retry attempts (#30 then #40, both
+		// abandoned) should link to #40 (the latest), not #30 (the original),
+		// so repeated retries chain consecutively instead of all fanning out
+		// from the first attempt.
+		mux := http.NewServeMux()
+		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, &github.IssuesSearchResult{
+				Total: github.Int(2),
+				Issues: []*github.Issue{
+					{Number: github.Int(30), Title: github.String(title), State: github.String("closed")},
+					{Number: github.Int(40), Title: github.String(title), State: github.String("closed")},
+				},
+			})
+		})
+		mux.HandleFunc("/repos/o/r/issues/30/comments", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, []*github.IssueComment{})
+		})
+		mux.HandleFunc("/repos/o/r/issues/40/comments", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(t, w, []*github.IssueComment{})
 		})
 
@@ -214,7 +263,10 @@ func TestFindExistingIssue(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if found {
-			t.Fatal("expected a closed issue with no approve/deny comment not to be reused")
+			t.Fatal("expected an abandoned issue not to be reused")
+		}
+		if a.supersededIssueNumber != 40 {
+			t.Fatalf("expected the most recent abandoned issue #40 to be superseded, got #%d", a.supersededIssueNumber)
 		}
 	})
 
@@ -229,9 +281,15 @@ func TestFindExistingIssue(t *testing.T) {
 			})
 		})
 		mux.HandleFunc("/repos/o/r/issues/31/comments", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Fatalf("expected no comment to be posted on an already-resolved issue, got %s", r.Method)
+			}
 			approver := "alice"
 			body := "approved"
 			writeJSON(t, w, []*github.IssueComment{{User: &github.User{Login: &approver}, Body: &body}})
+		})
+		mux.HandleFunc("/repos/o/r/issues/31", func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("expected no write to an already-resolved issue, got %s", r.Method)
 		})
 
 		a := &approvalEnvironment{
@@ -328,6 +386,76 @@ func TestFindOrCreateApprovalIssue(t *testing.T) {
 			t.Fatalf("expected 1 search call but got %d", searchCalls)
 		}
 	})
+
+	t.Run("creates_and_links_when_existing_match_is_abandoned", func(t *testing.T) {
+		var createdBody string
+		var supersededComment string
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, &github.IssuesSearchResult{
+				Total: github.Int(1),
+				Issues: []*github.Issue{
+					{Number: github.Int(30), Title: github.String(title), State: github.String("closed")},
+				},
+			})
+		})
+		mux.HandleFunc("/repos/o/r/issues/30/comments", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				writeJSON(t, w, []*github.IssueComment{})
+			case http.MethodPost:
+				var body struct {
+					Body string `json:"body"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("failed to decode comment body: %v", err)
+				}
+				supersededComment = body.Body
+				writeJSON(t, w, &github.IssueComment{})
+			default:
+				t.Fatalf("unexpected method %s", r.Method)
+			}
+		})
+		mux.HandleFunc("/repos/o/r/issues/30", func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("expected no edit to the abandoned issue, got %s", r.Method)
+		})
+		mux.HandleFunc("/repos/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected method %s on issue creation", r.Method)
+			}
+			var body struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("failed to decode request body: %v", err)
+			}
+			createdBody = body.Body
+			writeJSON(t, w, &github.Issue{Number: github.Int(31), Title: github.String(title), HTMLURL: github.String("https://github.com/o/r/issues/31")})
+		})
+
+		a := &approvalEnvironment{
+			client:          newTestClient(t, mux),
+			issueTitle:      title,
+			issueApprovers:  []string{"alice"},
+			targetRepoOwner: "o",
+			targetRepoName:  "r",
+			runID:           123,
+		}
+
+		if err := a.findOrCreateApprovalIssue(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if a.approvalIssueNumber != 31 {
+			t.Fatalf("expected newly created issue #31 but got #%d", a.approvalIssueNumber)
+		}
+		if !strings.Contains(createdBody, "Supersedes #30") {
+			t.Fatalf("expected the new issue body to reference the abandoned one, got:\n%s", createdBody)
+		}
+		if !strings.Contains(supersededComment, "Superseded by #31") {
+			t.Fatalf("expected a comment on the abandoned issue linking to the new one, got: %q", supersededComment)
+		}
+	})
 }
 
 func TestReconcileDuplicate(t *testing.T) {
@@ -415,6 +543,74 @@ func TestReconcileDuplicate(t *testing.T) {
 		}
 		if a.approvalIssueNumber != 20 {
 			t.Fatalf("expected to keep issue #20 but got #%d", a.approvalIssueNumber)
+		}
+	})
+
+	t.Run("migrates_away_from_an_abandoned_issue_to_a_valid_replacement", func(t *testing.T) {
+		// #20 (ours, lower-numbered) was abandoned - e.g. a sibling listener
+		// on this shared issue got cancelled and closed it with no approval
+		// or denial. #25 (higher-numbered) superseded it. Even though #20 has
+		// the lower number, it's not usable, so this run should switch to
+		// #25 instead of staying stuck on a dead issue.
+		var commentedIssue, editedIssue int
+		var closedState string
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, &github.IssuesSearchResult{
+				Total: github.Int(2),
+				Issues: []*github.Issue{
+					{Number: github.Int(20), Title: github.String(title), State: github.String("closed")},
+					{Number: github.Int(25), Title: github.String(title), State: github.String("open")},
+				},
+			})
+		})
+		mux.HandleFunc("/repos/o/r/issues/20/comments", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				// No approve/deny comment - this is what makes #20 abandoned.
+				writeJSON(t, w, []*github.IssueComment{{Body: github.String("Workflow cancelled, closing issue.")}})
+			case http.MethodPost:
+				commentedIssue = 20
+				writeJSON(t, w, &github.IssueComment{})
+			default:
+				t.Fatalf("unexpected method %s on comments", r.Method)
+			}
+		})
+		mux.HandleFunc("/repos/o/r/issues/20", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPatch {
+				t.Fatalf("unexpected method %s on issue edit", r.Method)
+			}
+			var body struct {
+				State string `json:"state"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("failed to decode request body: %v", err)
+			}
+			editedIssue = 20
+			closedState = body.State
+			writeJSON(t, w, &github.Issue{Number: github.Int(20), State: github.String("closed")})
+		})
+
+		a := &approvalEnvironment{
+			client:              newTestClient(t, mux),
+			issueTitle:          title,
+			targetRepoOwner:     "o",
+			targetRepoName:      "r",
+			approvalIssueNumber: 20,
+			approvalIssue:       &github.Issue{Number: github.Int(20)},
+		}
+
+		if err := a.reconcileDuplicate(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if a.approvalIssueNumber != 25 {
+			t.Fatalf("expected to switch to the valid replacement #25 but got #%d", a.approvalIssueNumber)
+		}
+		// Closing an already-closed issue is idempotent, so this is still
+		// attempted even though #20 is already closed.
+		if commentedIssue != 20 || editedIssue != 20 || closedState != "closed" {
+			t.Fatalf("expected issue #20 to be commented on and closed, got comment=%d edit=%d state=%q", commentedIssue, editedIssue, closedState)
 		}
 	})
 
