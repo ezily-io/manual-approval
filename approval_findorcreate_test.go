@@ -183,6 +183,77 @@ func TestFindExistingIssue(t *testing.T) {
 			t.Fatal("expected a title that only partially matches not to count as found")
 		}
 	})
+
+	t.Run("ignores_a_closed_issue_with_no_clear_resolution", func(t *testing.T) {
+		// e.g. one abandoned by a run that timed out or was cancelled before
+		// any approver responded - never got an approve/deny comment.
+		mux := http.NewServeMux()
+		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, &github.IssuesSearchResult{
+				Total: github.Int(1),
+				Issues: []*github.Issue{
+					{Number: github.Int(30), Title: github.String(title), State: github.String("closed")},
+				},
+			})
+		})
+		mux.HandleFunc("/repos/o/r/issues/30/comments", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, []*github.IssueComment{})
+		})
+
+		a := &approvalEnvironment{
+			client:           newTestClient(t, mux),
+			issueTitle:       title,
+			issueApprovers:   []string{"alice"},
+			minimumApprovals: 1,
+			targetRepoOwner:  "o",
+			targetRepoName:   "r",
+		}
+
+		found, err := a.findExistingIssue(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if found {
+			t.Fatal("expected a closed issue with no approve/deny comment not to be reused")
+		}
+	})
+
+	t.Run("reuses_a_closed_issue_that_was_actually_resolved", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(t, w, &github.IssuesSearchResult{
+				Total: github.Int(1),
+				Issues: []*github.Issue{
+					{Number: github.Int(31), Title: github.String(title), State: github.String("closed"), HTMLURL: github.String("https://github.com/o/r/issues/31")},
+				},
+			})
+		})
+		mux.HandleFunc("/repos/o/r/issues/31/comments", func(w http.ResponseWriter, r *http.Request) {
+			approver := "alice"
+			body := "approved"
+			writeJSON(t, w, []*github.IssueComment{{User: &github.User{Login: &approver}, Body: &body}})
+		})
+
+		a := &approvalEnvironment{
+			client:           newTestClient(t, mux),
+			issueTitle:       title,
+			issueApprovers:   []string{"alice"},
+			minimumApprovals: 1,
+			targetRepoOwner:  "o",
+			targetRepoName:   "r",
+		}
+
+		found, err := a.findExistingIssue(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !found {
+			t.Fatal("expected a closed issue with a clear approval to be reused")
+		}
+		if a.approvalIssueNumber != 31 {
+			t.Fatalf("expected issue #31 but got #%d", a.approvalIssueNumber)
+		}
+	})
 }
 
 func TestFindOrCreateApprovalIssue(t *testing.T) {

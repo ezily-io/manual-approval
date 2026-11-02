@@ -100,17 +100,52 @@ func (a *approvalEnvironment) findExistingIssue(ctx context.Context) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("failed to search for existing approval issue: %w", err)
 	}
-	if len(matches) == 0 {
+
+	reusable, err := a.reusableIssues(ctx, matches)
+	if err != nil {
+		return false, err
+	}
+	if len(reusable) == 0 {
 		return false, nil
 	}
 
-	canonical := lowestNumberedIssue(matches)
+	canonical := lowestNumberedIssue(reusable)
 	a.approvalIssue = canonical
 	a.approvalIssueNumber = canonical.GetNumber()
 	if err := a.registerAsListener(ctx); err != nil {
 		fmt.Printf("warning: failed to register as a listener on issue #%d: %v\n", a.approvalIssueNumber, err)
 	}
 	return true, nil
+}
+
+// reusableIssues filters out closed issues that were never actually resolved
+// (approved or denied) - e.g. one abandoned by a run that timed out or was
+// cancelled before any approver responded. Reusing one of those would
+// silently attach a retry to a dead issue - no new issue, no new
+// notification, and nothing left to comment on that would ever resolve it -
+// instead of prompting approvers again. Open issues, and closed issues whose
+// comments show a clear approve/deny outcome, are always safe to reuse.
+func (a *approvalEnvironment) reusableIssues(ctx context.Context, issues []*github.Issue) ([]*github.Issue, error) {
+	reusable := make([]*github.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue.GetState() != "closed" {
+			reusable = append(reusable, issue)
+			continue
+		}
+
+		comments, _, err := a.client.Issues.ListComments(ctx, a.targetRepoOwner, a.targetRepoName, issue.GetNumber(), &github.IssueListCommentsOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list comments on issue #%d: %w", issue.GetNumber(), err)
+		}
+		status, err := approvalFromComments(comments, a.issueApprovers, a.minimumApprovals)
+		if err != nil {
+			return nil, fmt.Errorf("failed to evaluate comments on issue #%d: %w", issue.GetNumber(), err)
+		}
+		if status == approvalStatusApproved || status == approvalStatusDenied {
+			reusable = append(reusable, issue)
+		}
+	}
+	return reusable, nil
 }
 
 // registerAsListener records this workflow run in the issue body's
