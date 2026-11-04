@@ -84,7 +84,7 @@ func abuseRateLimitHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Retry-After", "0")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
-	fmt.Fprint(w, `{"message":"You have exceeded a secondary rate limit","documentation_url":"https://docs.github.com/en/rest/overview/resources-in-the-rest-api#secondary-rate-limits"}`)
+	_, _ = fmt.Fprint(w, `{"message":"You have exceeded a secondary rate limit","documentation_url":"https://docs.github.com/en/rest/overview/resources-in-the-rest-api#secondary-rate-limits"}`)
 }
 
 func TestSearchIssuesByTitle(t *testing.T) {
@@ -141,7 +141,7 @@ func TestSearchIssuesByTitle(t *testing.T) {
 		mux.HandleFunc("/search/issues", func(w http.ResponseWriter, r *http.Request) {
 			calls++
 			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, `{"message":"Bad credentials"}`)
+			_, _ = fmt.Fprint(w, `{"message":"Bad credentials"}`)
 		})
 
 		a := &approvalEnvironment{client: newTestClient(t, mux), targetRepoOwner: "o", targetRepoName: "r"}
