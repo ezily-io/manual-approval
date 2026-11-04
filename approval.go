@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -302,15 +303,72 @@ func (a *approvalEnvironment) reconcileDuplicate(ctx context.Context) error {
 	return nil
 }
 
+// searchIssuesByTitle searches for issues matching title, retrying with
+// backoff when GitHub's Search API rate limit is hit. Many workflow runs can
+// call this at roughly the same time (they're all triggered by the same
+// push), which can exceed the Search API's 30-requests-per-minute limit even
+// though each individual run's own call volume is well within it.
 func (a *approvalEnvironment) searchIssuesByTitle(ctx context.Context, title string) ([]*github.Issue, error) {
 	query := fmt.Sprintf(`repo:%s/%s is:issue in:title "%s"`, a.targetRepoOwner, a.targetRepoName, title)
-	result, _, err := a.client.Search.Issues(ctx, query, nil)
-	if err != nil {
-		return nil, err
+
+	var lastErr error
+	for attempt := 0; attempt <= maxSearchRetries; attempt++ {
+		result, _, err := a.client.Search.Issues(ctx, query, nil)
+		if err == nil {
+			// The search API matches on tokens within the title, so
+			// defensively require an exact title match rather than trusting
+			// it did a phrase match.
+			return exactTitleMatches(result.Issues, title), nil
+		}
+		lastErr = err
+
+		delay, retryable := searchRetryDelay(err, attempt)
+		if !retryable || attempt == maxSearchRetries {
+			break
+		}
+		fmt.Printf("search rate-limited, retrying in %s (attempt %d/%d): %v\n", delay, attempt+1, maxSearchRetries, err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
 	}
-	// The search API matches on tokens within the title, so defensively
-	// require an exact title match rather than trusting it did a phrase match.
-	return exactTitleMatches(result.Issues, title), nil
+	return nil, lastErr
+}
+
+// searchRetryDelay reports how long to wait before retrying a failed search
+// and whether the error is worth retrying at all. Only rate-limit errors are
+// retryable; anything else (bad credentials, a malformed query) fails fast.
+func searchRetryDelay(err error, attempt int) (time.Duration, bool) {
+	var abuseErr *github.AbuseRateLimitError
+	if errors.As(err, &abuseErr) {
+		if abuseErr.RetryAfter != nil {
+			return minDuration(*abuseErr.RetryAfter, searchRetryMaxDelay), true
+		}
+		return backoffDelay(attempt), true
+	}
+
+	var rateErr *github.RateLimitError
+	if errors.As(err, &rateErr) {
+		if wait := time.Until(rateErr.Rate.Reset.Time); wait > 0 {
+			return minDuration(wait, searchRetryMaxDelay), true
+		}
+		return backoffDelay(attempt), true
+	}
+
+	return 0, false
+}
+
+func backoffDelay(attempt int) time.Duration {
+	delay := searchRetryBaseDelay * time.Duration(1<<attempt)
+	return minDuration(delay, searchRetryMaxDelay)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func exactTitleMatches(issues []*github.Issue, title string) []*github.Issue {

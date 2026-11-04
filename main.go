@@ -56,9 +56,13 @@ func handleInterrupt(ctx context.Context, client *github.Client, apprv *approval
 func newCommentLoopChannel(ctx context.Context, apprv *approvalEnvironment, client *github.Client) chan int {
 	channel := make(chan int)
 	go func() {
-		for {
-			if err := apprv.reconcileDuplicate(ctx); err != nil {
-				fmt.Printf("warning: failed to reconcile a duplicate approval issue: %v\n", err)
+		for iteration := 0; ; iteration++ {
+			// Reconciling on every single poll doesn't scale once many
+			// workflow runs share one issue - see reconcileEveryNPolls.
+			if iteration%reconcileEveryNPolls == 0 {
+				if err := apprv.reconcileDuplicate(ctx); err != nil {
+					fmt.Printf("warning: failed to reconcile a duplicate approval issue: %v\n", err)
+				}
 			}
 
 			comments, _, err := client.Issues.ListComments(ctx, apprv.targetRepoOwner, apprv.targetRepoName, apprv.approvalIssueNumber, &github.IssueListCommentsOptions{})
