@@ -9,10 +9,27 @@ import (
 const (
 	pollingInterval time.Duration = 10 * time.Second
 
+	// reconcileEveryNPolls spaces out reconcileDuplicate's search calls to
+	// once every N comment-polling iterations (N * pollingInterval), instead
+	// of every single one. With many workflow runs able to share one
+	// approval issue, searching on every poll can exceed GitHub Search
+	// API's 30-requests-per-minute limit; checking less often keeps
+	// sustained load well under that while comment-polling (and so approval
+	// responsiveness) stays on its own faster cadence.
+	reconcileEveryNPolls int = 6
+
 	// maxEmbeddedCustomBodyLength keeps the caller-supplied issue-body embedded
 	// in the issue's own body safely under GitHub's issue body size limit. If
 	// it's longer than this, it's posted as a follow-up comment instead.
 	maxEmbeddedCustomBodyLength int = 60000
+
+	// Retry/backoff for searchIssuesByTitle when GitHub's Search API rate
+	// limit is hit. maxSearchRetries bounds how long a single search can
+	// block so a genuinely broken case (e.g. bad credentials) still
+	// surfaces an error instead of hanging indefinitely.
+	maxSearchRetries     int           = 4
+	searchRetryBaseDelay time.Duration = 5 * time.Second
+	searchRetryMaxDelay  time.Duration = 90 * time.Second
 
 	envVarRepoFullName                       string = "GITHUB_REPOSITORY"
 	envVarRunID                              string = "GITHUB_RUN_ID"
